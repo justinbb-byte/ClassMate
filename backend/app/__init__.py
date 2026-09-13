@@ -1,0 +1,1 @@
+"""ClassMate backend application package."""

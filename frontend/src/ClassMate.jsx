@@ -5,12 +5,13 @@ import {
 } from "lucide-react";
 
 /* ────────────────────────────────────────────────────────────────
-   MOCK DATA  —  this is also the API contract.
-   Backend: return exactly this shape from GET /api/state
-   All timestamps are ISO 8601 strings.
-   Dates are generated relative to "now" so the demo never goes stale;
-   the real backend returns fixed ISO strings.
+   MOCK DATA — fallback fixture and the frozen API contract.
+   The app fetches the real state from GET /api/state on mount.
    ──────────────────────────────────────────────────────────────── */
+
+// In local Vite development an empty base uses the /api proxy below. Set
+// VITE_API_BASE_URL for a deployed frontend that calls the backend directly.
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "";
 
 const day = 86400000;
 const iso = (offsetDays, hour = 23, min = 59) => {
@@ -20,7 +21,7 @@ const iso = (offsetDays, hour = 23, min = 59) => {
 };
 
 const mockData = {
-  student: { name: "Wan", timezone: "Asia/Kuala_Lumpur" },
+  student: { id: "student_001", name: "Wan", timezone: "Asia/Kuala_Lumpur" },
 
   courses: [
     { id: "c1", code: "BDA2043", name: "Big Data Analytics" },
@@ -137,7 +138,7 @@ function analyse(a) {
   const start = new Date(a.assignedAt).getTime();
   const due = new Date(a.dueAt).getTime();
 
-  const actual = a.milestones.reduce((sum, m) => {
+  const calculatedActual = a.milestones.reduce((sum, m) => {
     if (m.done) return sum + m.weight;
     if (m.targetWords > 0) return sum + m.weight * Math.min(m.words / m.targetWords, 1);
     return sum;
@@ -145,18 +146,18 @@ function analyse(a) {
 
   const span = Math.max(due - start, 1);
   const elapsed = Math.min(Math.max((now - start) / span, 0), 1);
-  const expected = a.status === "submitted" ? 100 : elapsed * 100;
-  const gap = actual - expected;
+  const calculatedExpected = a.status === "submitted" ? 100 : elapsed * 100;
+  const calculatedGap = calculatedActual - calculatedExpected;
 
   const hoursLeft = (due - now) / 3600000;
   const daysLeft = hoursLeft / 24;
 
-  let band = "green";
+  let calculatedBand = "green";
   if (a.status !== "submitted") {
-    if (gap < -25) band = "red";
-    else if (gap < -10) band = "amber";
+    if (calculatedGap < -25) calculatedBand = "red";
+    else if (calculatedGap < -10) calculatedBand = "amber";
   }
-  if (a.status !== "submitted" && hoursLeft < 0) band = "red";
+  if (a.status !== "submitted" && hoursLeft < 0) calculatedBand = "red";
 
   const next = a.milestones.find((m) => !m.done) || null;
   const wordsLeft = a.milestones.reduce(
@@ -169,9 +170,24 @@ function analyse(a) {
     : 0;
 
   const score =
-    a.status === "submitted" ? -999 : -gap * 1.6 + Math.max(0, 14 - daysLeft) * 4 + a.gradeWeightPct * 0.3;
+    a.status === "submitted" ? -999 : -calculatedGap * 1.6 + Math.max(0, 14 - daysLeft) * 4 + a.gradeWeightPct * 0.3;
 
-  return { actual, expected, gap, daysLeft, hoursLeft, band, next, wordsLeft, estMinutes, score };
+  // Prefer server-computed progress when the API has supplied it. The local
+  // calculation remains a fallback while the first request is loading.
+  const p = a.progress;
+
+  return {
+    actual: p?.actualPct ?? calculatedActual,
+    expected: p?.expectedPct ?? calculatedExpected,
+    gap: p?.gap ?? calculatedGap,
+    daysLeft: p?.daysLeft ?? daysLeft,
+    hoursLeft,
+    band: p?.band ?? calculatedBand,
+    next,
+    wordsLeft: p?.wordsLeft ?? wordsLeft,
+    estMinutes,
+    score: p?.priorityScore ?? score,
+  };
 }
 
 const tone = (band) =>
@@ -670,7 +686,7 @@ function reply(input, data) {
   };
 }
 
-function ChatPanel({ data, messages, setMessages, pending, setPending }) {
+function ChatPanel({ messages, pending, onAsk }) {
   const [input, setInput] = useState("");
   const endRef = useRef(null);
 
@@ -681,17 +697,11 @@ function ChatPanel({ data, messages, setMessages, pending, setPending }) {
   const send = (text) => {
     const t = text.trim();
     if (!t || pending) return;
-    setMessages((m) => [...m, { role: "user", text: t }]);
     setInput("");
-    setPending(true);
-    // TODO backend: replace with POST /api/chat { message, studentId }
-    setTimeout(() => {
-      setMessages((m) => [...m, { role: "bot", ...reply(t, data) }]);
-      setPending(false);
-    }, 650);
+    onAsk(t);
   };
 
-  const chips = ["What should I do today?", "Catch me up", "What's due this week?"];
+  const chips = ["What should I do today?", "Catch me up", "What's due this week?", "Break it down"];
 
   return (
     <div className="flex flex-col h-full" style={{ background: C.card }}>
@@ -797,25 +807,64 @@ function ChatPanel({ data, messages, setMessages, pending, setPending }) {
 /* ── shell ───────────────────────────────────────────────────── */
 
 export default function ClassMate() {
-  const data = mockData;
+  const [data, setData] = useState(mockData);
+  const [syncing, setSyncing] = useState(true);
+  const [apiError, setApiError] = useState(null);
   const [view, setView] = useState("today");
   const [openId, setOpenId] = useState(null);
   const [pending, setPending] = useState(false);
-  const [messages, setMessages] = useState([
-    {
-      role: "bot",
-      text: `Morning ${data.student.name}. You have three tasks open and one deadline inside 24 hours. Want the plan for today?`,
-    },
-  ]);
+  const [messages, setMessages] = useState([]);
 
-  const ask = (text) => {
+  useEffect(() => {
+    const controller = new AbortController();
+
+    fetch(`${API_BASE_URL}/api/state`, { signal: controller.signal })
+      .then(async (response) => {
+        if (!response.ok) throw new Error(`State request failed (${response.status})`);
+        return response.json();
+      })
+      .then((remoteState) => {
+        setData(remoteState);
+        setApiError(null);
+      })
+      .catch((error) => {
+        if (error.name !== "AbortError") setApiError(error.message);
+      })
+      .finally(() => setSyncing(false));
+
+    return () => controller.abort();
+  }, []);
+
+  useEffect(() => {
+    if (!messages.length && data?.student?.name) {
+      setMessages([{
+        role: "bot",
+        text: `Morning ${data.student.name}. You have three tasks open and one deadline inside 24 hours. Want the plan for today?`,
+      }]);
+    }
+  }, [data, messages.length]);
+
+  const ask = async (text) => {
     setMessages((m) => [...m, { role: "user", text }]);
     setPending(true);
     setView("chat");
-    setTimeout(() => {
-      setMessages((m) => [...m, { role: "bot", ...reply(text, data) }]);
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/chat`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message: text, studentId: data.student.id }),
+      });
+      if (!response.ok) throw new Error(`Chat request failed (${response.status})`);
+      const result = await response.json();
+      setMessages((m) => [...m, { role: "bot", ...result }]);
+    } catch (error) {
+      setMessages((m) => [...m, {
+        role: "bot",
+        text: "I could not reach the ClassMate server. Check that the backend is running on port 8000.",
+      }]);
+    } finally {
       setPending(false);
-    }, 650);
+    }
   };
 
   const openTask = (id) => {
@@ -886,9 +935,17 @@ export default function ClassMate() {
       {/* main column */}
       <main className="flex-1 overflow-y-auto">
         <div className="max-w-[640px] mx-auto px-5 sm:px-8 py-7 pb-28 lg:pb-12">
+          {(syncing || apiError) && (
+            <div
+              className="mb-4 px-3 py-2 rounded-lg text-xs"
+              style={{ background: apiError ? C.nowSoft : C.calmSoft, color: apiError ? C.now : C.calm }}
+            >
+              {apiError ? `Using demo data: ${apiError}` : "Syncing your academic data…"}
+            </div>
+          )}
           {view === "chat" ? (
             <div className="lg:hidden -mx-5 sm:-mx-8 -my-7 h-[calc(100vh-72px)]">
-              <ChatPanel data={data} messages={messages} setMessages={setMessages} pending={pending} setPending={setPending} />
+              <ChatPanel messages={messages} pending={pending} onAsk={ask} />
             </div>
           ) : (
             main
@@ -899,7 +956,7 @@ export default function ClassMate() {
 
       {/* desktop chat panel */}
       <aside className="hidden lg:block w-[380px] shrink-0" style={{ borderLeft: `1px solid ${C.line}` }}>
-        <ChatPanel data={data} messages={messages} setMessages={setMessages} pending={pending} setPending={setPending} />
+        <ChatPanel messages={messages} pending={pending} onAsk={ask} />
       </aside>
 
       {/* mobile bottom nav */}
